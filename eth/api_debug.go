@@ -17,6 +17,7 @@
 package eth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -28,7 +29,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/log"
@@ -89,24 +89,42 @@ func (api *DebugAPI) DumpBlock(blockNr rpc.BlockNumber) (state.Dump, error) {
 	return stateDb.RawDump(opts), nil
 }
 
-func (api *DebugAPI) ExecutionWitness(blockNr rpc.BlockNumber) (*stateless.Witness, error) {
-	witness := &stateless.Witness{}
-
-	block := api.eth.blockchain.GetBlockByNumber(uint64(blockNr))
-	if block == nil {
-		return nil, fmt.Errorf("block #%d not found", blockNr)
-	}
-	statedb, err := api.eth.blockchain.StateAt(block.ParentHash())
+func (api *DebugAPI) ExecutionWitness(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (hexutil.Bytes, error) {
+	block, err := api.eth.APIBackend.BlockByNumberOrHash(ctx, blockNrOrHash)
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve parent state: %v", err)
+		return nil, fmt.Errorf("failed to retrieve block: %w", err)
 	}
+	if block == nil {
+		return nil, fmt.Errorf("block not found: %s", blockNrOrHash.String())
+	}
+
+	witness, err := stateless.NewWitness(block.Header(), api.eth.blockchain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create witness: %w", err)
+	}
+
+	parentHeader := witness.Headers[0]
+	statedb, err := api.eth.blockchain.StateAt(parentHeader.Root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve parent state: %w", err)
+	}
+
 	statedb.StartPrefetcher("debug_execution_witness", witness)
 
-	if _, err = api.eth.blockchain.Processor().Process(block, statedb, vm.Config{}); err != nil {
-		return nil, fmt.Errorf("failed to process block %d: %v", block.Number(), err)
+	res, err := api.eth.blockchain.Processor().Process(block, statedb, *api.eth.blockchain.GetVMConfig())
+	if err != nil {
+		return nil, fmt.Errorf("failed to process block %d: %w", block.Number(), err)
 	}
 
-	return witness, nil
+	if err := api.eth.blockchain.Validator().ValidateState(block, statedb, res, false); err != nil {
+		return nil, fmt.Errorf("failed to validate block %d: %w", block.Number(), err)
+	}
+
+	var buf bytes.Buffer
+	if err = witness.EncodeRLP(&buf); err != nil {
+		return nil, fmt.Errorf("failed to encode witness: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // Preimage is a debug API function that returns the preimage for a sha3 hash, if known.
